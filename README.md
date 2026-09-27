@@ -14,8 +14,8 @@ other program:
 
 - **Namespace pivots.** sshd dials from its own network namespace.
   funpipe dials from wherever it runs: under `nsenter -n`, as a systemd
-  unit in another namespace, or in another container that is handed the
-  session's descriptors.
+  unit in another namespace, or in another container that is passed the
+  session's descriptors (`-pass`, `-listen`).
 - **Unix sockets, one by one.** OpenSSH's `permitopen` takes `host:port`
   only. A key with it can reach no Unix socket, and a key without it can
   reach every socket its user can (OpenSSH 9.6). funpipe admits exactly
@@ -34,7 +34,13 @@ other program:
 - `go/cmd/funpipe`: the server as a command. `-allow FILE` admits only
   the destinations FILE lists, `NET PORT` or a socket's path a line;
   without it, every TCP destination and no Unix socket is admitted.
-  `-log FILE` logs there instead of to syslog.
+  `-log FILE` logs there instead of to syslog. With `-pass SOCKET` it
+  serves nothing itself: it passes the session's stdin and stdout over a
+  Unix socket to a funpipe run with `-listen
+  SOCKET` on the far side of a gap sshd cannot cross, such as a container
+  with no route to the destinations. The listener's `-allow` and `-log`
+  apply; `-pass` takes neither. Whoever can reach the socket's path can
+  pass it a session, so its directory decides who may.
 - `go/server`: the server as a package, for programs of their own: a
   `Server` with the hook and, optionally, its own `Dial`. It serves Unix
   sockets only when its `Unix` field is set.
