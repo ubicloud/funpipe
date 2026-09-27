@@ -39,10 +39,10 @@ FIN = 1
 MAX, INITIAL = 32_768, 256 * 1024
 # Safety caps. Client misuse is the client's problem, but the server must not
 # let a buggy or hostile client OOM the bastion (and thus other processes).
-# Invariant: a client honoring flow control has at most INITIAL/MAX = 8 frames
-# in flight per stream, so BACKLOG_MAX only trips on a protocol violation.
+# Invariant: a client honoring flow control has at most INITIAL bytes in
+# flight per stream, however it frames them, so a backlog past INITIAL is a
+# protocol violation.
 STREAMS_MAX = 64    # concurrent streams per tunnel; cap on threads + sockets + memory
-BACKLOG_MAX = 16    # frames per stream; ~512KB worst case per stream
 
 
 class Mux:
@@ -126,6 +126,7 @@ class Stream:
     def __init__(self, mux, sid, dest):
         self.mux, self.id, self.dest = mux, sid, dest
         self.rq = queue.Queue()
+        self.backlog = 0  # bytes pushed and not yet read
         self.swin = INITIAL
         self.cv = threading.Condition()
         self.dead = False
@@ -136,6 +137,8 @@ class Stream:
         c = self.rq.get()
         if c is None:
             return None
+        with self.cv:
+            self.backlog -= len(c)
         self.mux.frame(WIN, 0, self.id, struct.pack("!I", len(c)))
         return c
 
@@ -166,17 +169,20 @@ class Stream:
     def push(self, c):
         # None = EOF, always admitted; it also kills a writer parked on WIN
         # credit that will never arrive. Data is subject to the hard backlog
-        # clamp: a well-behaved client stalls naturally at INITIAL (we stop
-        # sending WIN while c2s blocks on the upstream); this catches a client
-        # ignoring flow control. Tunnel-fatal on purpose.
+        # clamp, in bytes: a well-behaved client stalls naturally at INITIAL
+        # (we stop sending WIN while c2s blocks on the upstream); this catches
+        # a client ignoring flow control. Tunnel-fatal on purpose.
         if c is None:
             self.rq.put(c)
             with self.cv:
                 self.dead = True
                 self.cv.notify_all()
             return
-        if self.rq.qsize() >= BACKLOG_MAX:
-            raise RuntimeError(f"stream {self.id}: backlog {self.rq.qsize()} >= {BACKLOG_MAX}")
+        with self.cv:
+            n = self.backlog + len(c)
+            if n > INITIAL:
+                raise RuntimeError(f"stream {self.id}: backlog {n} > {INITIAL} bytes")
+            self.backlog = n
         self.rq.put(c)
 
 
