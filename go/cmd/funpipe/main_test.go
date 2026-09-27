@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ubicloud/funpipe/go/server"
 )
 
 // TestMain runs the command itself when a test starts this binary with
@@ -111,5 +114,116 @@ fd25:185d:32f9:4524::/64 443
 	}
 	if err := allowed(filepath.Join(t.TempDir(), "none"), "tcp", "192.168.188.1:22"); err == nil {
 		t.Error("a missing list admitted a stream")
+	}
+}
+
+// TestPass passes sessions from -pass to -listen as sshd gives them, a pipe
+// each way: one to an echo the list admits, one to a destination it does
+// not.
+// relay starts a funpipe -listen at sock, admitting the echo server at
+// dev, and logging to logTo.
+func relay(t *testing.T) (sock, dev, logTo string) {
+	t.Helper()
+	dir := t.TempDir()
+	dev = filepath.Join(dir, "dev.sock")
+	dl, err := net.ListenUnix("unix", &net.UnixAddr{Name: dev, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { dl.Close() })
+	go func() {
+		for {
+			c, err := dl.AcceptUnix()
+			if err != nil {
+				return
+			}
+			go func() { io.Copy(c, c); c.CloseWrite() }()
+		}
+	}()
+	list, logTo, sock := filepath.Join(dir, "allow"), filepath.Join(dir, "log"), filepath.Join(dir, "relay.sock")
+	os.WriteFile(list, []byte(dev+"\n"), 0o600)
+	lg, err := newLogger(logTo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go listenOn(sock, &server.Server{Hook: hook(lg, list), Unix: true}, lg)
+	for i := 0; i < 100; i++ {
+		if _, err := os.Stat(sock); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return sock, dev, logTo
+}
+
+// session passes a session asking for dest to the listener at sock, sends
+// "hello" after wait, and returns what came back and -pass's exit status.
+func session(sock, dest string, wait time.Duration) (string, int) {
+	inR, inW, _ := os.Pipe()
+	outR, outW, _ := os.Pipe()
+	code := make(chan int)
+	go func() { code <- passOn(sock, dest, inR, outW) }()
+	time.Sleep(wait)
+	inW.Write([]byte("hello\n"))
+	inW.Close()
+	b, _ := io.ReadAll(outR)
+	outR.Close()
+	return string(b), <-code
+}
+
+func TestPass(t *testing.T) {
+	sock, dev, logTo := relay(t)
+	if got, code := session(sock, dev, 0); got != "hello\n" || code != 0 {
+		t.Errorf("a destination on the list: %q back, exit %d", got, code)
+	}
+	if got, code := session(sock, "192.0.2.1 22", 0); got != "" || code != 1 {
+		t.Errorf("a destination not on the list: %q back, exit %d", got, code)
+	}
+	b, _ := os.ReadFile(logTo)
+	if !strings.Contains(string(b), "session passed in at "+sock+": one stream to") || !strings.Contains(string(b), "not on the list") {
+		t.Errorf("the log:\n%s", b)
+	}
+}
+
+// A connection that passes nothing is hung up on, so idle ones cannot
+// pile up and starve the listener of descriptors; a session itself may
+// last as long as it likes.
+func TestIdleHandoff(t *testing.T) {
+	old := handoffTimeout
+	handoffTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { handoffTimeout = old })
+	sock, dev, _ := relay(t)
+	c, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if b, err := io.ReadAll(c); err != nil || !strings.HasPrefix(string(b), "1 ") {
+		t.Fatalf("idle connection: %q, %v", b, err)
+	}
+	if got, code := session(sock, dev, 3*handoffTimeout); got != "hello\n" || code != 0 {
+		t.Errorf("a slow session: %q back, exit %d", got, code)
+	}
+}
+
+func TestCheckFlags(t *testing.T) {
+	for _, c := range []struct {
+		pass, listen, allow, log string
+		nargs                    int
+		ok                       bool
+	}{
+		{"", "", "", "", 0, true},
+		{"", "", "a", "l", 2, true},
+		{"s", "", "", "", 2, true},
+		{"", "s", "a", "l", 0, true},
+		{"s", "s", "", "", 0, false},
+		{"s", "", "a", "", 0, false},
+		{"s", "", "", "l", 0, false},
+		{"", "s", "", "", 1, false},
+	} {
+		if err := checkFlags(c.pass, c.listen, c.allow, c.log, c.nargs); (err == nil) != c.ok {
+			t.Errorf("%+v: %v", c, err)
+		}
 	}
 }

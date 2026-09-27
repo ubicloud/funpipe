@@ -2,6 +2,8 @@
 // often as sshd's forced command:
 //
 //	funpipe [-allow FILE] [-log FILE] [HOST PORT | PATH]
+//	funpipe -pass SOCKET [HOST PORT | PATH]
+//	funpipe -listen SOCKET [-allow FILE] [-log FILE]
 //
 // With no destination it serves the stream multiplexer that mews and the
 // other clients speak. With one, in its arguments or in
@@ -17,6 +19,13 @@
 // destination named by a host name is on no list, and a list with a line
 // it cannot read admits nothing. Without -allow it admits every TCP
 // destination and no Unix socket.
+//
+// With -pass it serves nothing itself. It passes its standard input and
+// output, and what the session asks for, over the Unix socket SOCKET to a
+// funpipe listening there with -listen, which serves the session as its
+// own; -pass exits with its answer (handoff.go). The list and the log are
+// the listener's, so -pass refuses -allow and -log rather than ignore
+// them, and -listen refuses a destination.
 package main
 
 import (
@@ -46,34 +55,71 @@ func main() {
 	signal.Ignore(syscall.SIGPIPE)
 	allow := flag.String("allow", "", "admit only the destinations this file lists")
 	logTo := flag.String("log", "", "log to this file, not to syslog")
+	pass := flag.String("pass", "", "hand the session to the funpipe listening on this Unix socket")
+	listen := flag.String("listen", "", "serve the sessions handed to this Unix socket")
 	flag.Parse()
+	if err := checkFlags(*pass, *listen, *allow, *logTo, flag.NArg()); err != nil {
+		fmt.Fprintln(os.Stderr, "funpipe:", err)
+		os.Exit(2)
+	}
+
+	dest := strings.Join(flag.Args(), " ")
+	if dest == "" {
+		dest = strings.TrimSpace(os.Getenv("SSH_ORIGINAL_COMMAND"))
+	}
+	if *pass != "" {
+		os.Exit(passOn(*pass, dest, os.Stdin, os.Stdout))
+	}
 	lg, err := newLogger(*logTo)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "funpipe:", err)
 		os.Exit(1)
 	}
 	s := &server.Server{Hook: hook(lg, *allow), Unix: *allow != ""}
-
-	dest := strings.Join(flag.Args(), " ")
-	if dest == "" {
-		dest = strings.TrimSpace(os.Getenv("SSH_ORIGINAL_COMMAND"))
-	}
-	who := "a local user"
-	if c := strings.Fields(os.Getenv("SSH_CONNECTION")); len(c) >= 2 {
-		who = c[0] + " port " + c[1]
-	}
-	if dest == "" || dest == "funpipe" {
-		lg.printf("session from %s, uid %d: the multiplexer", who, os.Getuid())
-		err = s.Serve(os.Stdin, os.Stdout)
+	if *listen != "" {
+		err = listenOn(*listen, s, lg)
 	} else {
-		lg.printf("session from %s, uid %d: one stream to %q", who, os.Getuid(), dest)
-		err = s.Splice(os.Stdin, stdout{os.Stdout}, dest)
+		who := "a local user"
+		if c := strings.Fields(os.Getenv("SSH_CONNECTION")); len(c) >= 2 {
+			who = c[0] + " port " + c[1]
+		}
+		err = serve(s, lg, fmt.Sprintf("session from %s, uid %d", who, os.Getuid()), os.Stdin, os.Stdout, dest)
 	}
 	if err != nil {
-		lg.printf("session from %s ended: %v", who, err)
 		fmt.Fprintln(os.Stderr, "funpipe:", err)
 		os.Exit(1)
 	}
+}
+
+// checkFlags refuses flags that would be ignored: a list that silently
+// does not apply is worse than none.
+func checkFlags(pass, listen, allow, logTo string, nargs int) error {
+	switch {
+	case pass != "" && listen != "":
+		return errors.New("-pass and -listen are the two ends of a handoff: give one")
+	case pass != "" && (allow != "" || logTo != ""):
+		return errors.New("-pass serves nothing itself: give -allow and -log to the funpipe -listen it passes to")
+	case listen != "" && nargs > 0:
+		return errors.New("-listen takes no destination: each session passed to it names its own")
+	}
+	return nil
+}
+
+// serve serves one session on in and out: the multiplexer, or one stream
+// to dest.
+func serve(s *server.Server, lg *logger, who string, in, out *os.File, dest string) error {
+	var err error
+	if dest == "" || dest == "funpipe" {
+		lg.printf("%s: the multiplexer", who)
+		err = s.Serve(in, out)
+	} else {
+		lg.printf("%s: one stream to %q", who, dest)
+		err = s.Splice(in, stdout{out}, dest)
+	}
+	if err != nil {
+		lg.printf("%s ended: %v", who, err)
+	}
+	return err
 }
 
 // hook admits a stream by the list, if there is one, and logs it.
