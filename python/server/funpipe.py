@@ -127,6 +127,7 @@ class Stream:
         self.swin = INITIAL
         self.cv = threading.Condition()
         self.dead = False
+        self.sock = None
 
     def read(self):
         # Frame payloads are <= u16 max, so chunks pass through whole; the
@@ -158,6 +159,13 @@ class Stream:
 
     def close_write(self):
         self.mux.frame(DATA, FIN, self.id)
+
+    def shutdown(self):
+        try:
+            if self.sock is not None:
+                self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     def grant(self, d):
         with self.cv:
@@ -203,6 +211,7 @@ def serve(stream, dial=_dial):
         stream.close_write()
         stream.mux.retire(stream.id)
         return
+    stream.sock = sock
 
     def s2c():
         try:
@@ -218,10 +227,7 @@ def serve(stream, dial=_dial):
                 sock.sendall(data)
         except OSError:
             pass
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
+        stream.shutdown()
 
     t1 = threading.Thread(target=s2c, daemon=True)
     t1.start()
