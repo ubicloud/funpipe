@@ -219,7 +219,7 @@ def serve(stream, dial=_dial):
         except OSError:
             pass
         try:
-            sock.shutdown(socket.SHUT_WR)
+            sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
 
