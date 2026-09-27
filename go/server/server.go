@@ -67,7 +67,7 @@ var (
 
 // An Event is a stream when a client opens it and when it ends.
 type Event struct {
-	Stream  uint32 // the client's number for it
+	Stream  uint32 // the client's number for it; 0 for Splice's one stream
 	Network string // "tcp" or "unix"; "" when the destination is not one
 	Address string // host:port or a socket's path; as sent when Network is ""
 	Opened  time.Time
@@ -470,6 +470,59 @@ func (st *stream) why(err error, up bool) error {
 		return fmt.Errorf("after the client's close: %w", err)
 	}
 	return err
+}
+
+// Splice serves one stream to dest straight over r and w, with no frames.
+// Each way closes on its own, as nc -N does: the end of r closes the
+// destination's writing side, and the end of the destination's closes w,
+// by CloseWrite if w has one, else by Close. It returns when both have
+// ended.
+func (s *Server) Splice(r io.Reader, w io.Writer, dest string) error {
+	e := Event{Opened: time.Now()}
+	e.Up, e.Down, e.Err = s.splice(r, w, dest, &e)
+	e.End = true
+	s.hook(e)
+	return e.Err
+}
+
+func (s *Server) splice(r io.Reader, w io.Writer, dest string, e *Event) (up, down int64, err error) {
+	if e.Network, e.Address, err = parseDest(dest); err != nil {
+		e.Address = dest
+		closeWrite(w)
+		return 0, 0, err
+	}
+	if err = s.admit(*e); err != nil {
+		closeWrite(w)
+		return 0, 0, err
+	}
+	conn, err := s.dial(context.Background(), e.Network, e.Address)
+	if err != nil {
+		closeWrite(w)
+		return 0, 0, err
+	}
+	defer conn.Close()
+	var upErr error
+	done := make(chan struct{})
+	go func() {
+		up, upErr = io.Copy(conn, r)
+		closeWrite(conn)
+		close(done)
+	}()
+	down, err = io.Copy(w, conn)
+	closeWrite(w)
+	<-done
+	if err == nil {
+		err = upErr
+	}
+	return up, down, err
+}
+
+func closeWrite(x any) {
+	if c, ok := x.(interface{ CloseWrite() error }); ok {
+		c.CloseWrite()
+	} else if c, ok := x.(io.Closer); ok {
+		c.Close()
+	}
 }
 
 // parseDest reads a destination: "host port", split at the last space so
