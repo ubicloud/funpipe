@@ -47,6 +47,7 @@ class Mux:
         self.rfd, self.wfd = rfd, wfd
         self.wm = threading.Lock()
         self.streams = {}
+        self.closed = False
         self.accept_q = queue.Queue()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
 
@@ -114,8 +115,10 @@ class Mux:
                 elif t == WIN:
                     s.grant(struct.unpack("!I", p)[0])  # malformed = tunnel-fatal
         finally:
+            self.closed = True
             for s in list(self.streams.values()):
                 s.push(None)
+                s.shutdown()
             self.accept_q.put(None)
 
 
@@ -128,6 +131,7 @@ class Stream:
         self.cv = threading.Condition()
         self.dead = False
         self.sock = None
+        self.sock_lock = threading.Lock()
 
     def read(self):
         # Frame payloads are <= u16 max, so chunks pass through whole; the
@@ -161,11 +165,14 @@ class Stream:
         self.mux.frame(DATA, FIN, self.id)
 
     def shutdown(self):
-        try:
-            if self.sock is not None:
-                self.sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
+        # serve() clears sock under sock_lock before it closes the socket,
+        # so the fd cannot be closed and reused during the call.
+        with self.sock_lock:
+            try:
+                if self.sock is not None:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def grant(self, d):
         with self.cv:
@@ -211,7 +218,13 @@ def serve(stream, dial=_dial):
         stream.close_write()
         stream.mux.retire(stream.id)
         return
-    stream.sock = sock
+    # The reader sets closed, then shuts sock down under sock_lock. Set
+    # sock and read closed under the lock, so one of the two shuts it down.
+    with stream.sock_lock:
+        stream.sock = sock
+        closed = stream.mux.closed
+    if closed:
+        stream.shutdown()
 
     def s2c():
         try:
@@ -235,6 +248,8 @@ def serve(stream, dial=_dial):
     t2.start()
     t1.join()
     t2.join()
+    with stream.sock_lock:
+        stream.sock = None
     sock.close()
     stream.mux.retire(stream.id)
 
@@ -245,10 +260,10 @@ def run(rfd, wfd, dial=_dial):
     # sockets are closed deterministically before we return (matters when
     # embedded in a longer-lived process). Returns the Mux for inspection.
     #
-    # On EOF the reader's finally-block push(None)s every live stream, which
-    # unblocks each serve()'s s2c/c2s, so these joins are bounded by in-flight
-    # upstream I/O, not indefinite. Threads stay daemon so a hung upstream
-    # can't wedge interpreter shutdown.
+    # On EOF the reader's finally-block push(None)s and shuts down every live
+    # stream, which unblocks each serve()'s s2c/c2s, so these joins are bounded
+    # by in-flight upstream I/O, not indefinite. Threads stay daemon so a hung
+    # upstream can't wedge interpreter shutdown.
     mux = Mux(rfd, wfd).start()
     workers = []
     while (s := mux.accept()) is not None:
