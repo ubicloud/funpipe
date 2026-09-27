@@ -39,10 +39,7 @@ FIN = 1
 MAX, INITIAL = 32_768, 256 * 1024
 # Safety caps. Client misuse is the client's problem, but the server must not
 # let a buggy or hostile client OOM the bastion (and thus other processes).
-# Invariant: a client honoring flow control has at most INITIAL/MAX = 8 frames
-# in flight per stream, so BACKLOG_MAX only trips on a protocol violation.
 STREAMS_MAX = 64    # concurrent streams per tunnel; cap on threads + sockets + memory
-BACKLOG_MAX = 16    # frames per stream; ~512KB worst case per stream
 
 
 class Mux:
@@ -126,6 +123,7 @@ class Stream:
     def __init__(self, mux, sid, dest):
         self.mux, self.id, self.dest = mux, sid, dest
         self.rq = queue.Queue()
+        self.unread_bytes = 0
         self.swin = INITIAL
         self.cv = threading.Condition()
         self.dead = False
@@ -136,6 +134,9 @@ class Stream:
         c = self.rq.get()
         if c is None:
             return None
+        # Decrement before sending WIN, or a prompt client trips the clamp.
+        with self.cv:
+            self.unread_bytes -= len(c)
         self.mux.frame(WIN, 0, self.id, struct.pack("!I", len(c)))
         return c
 
@@ -165,18 +166,20 @@ class Stream:
 
     def push(self, c):
         # None = EOF, always admitted; it also kills a writer parked on WIN
-        # credit that will never arrive. Data is subject to the hard backlog
-        # clamp: a well-behaved client stalls naturally at INITIAL (we stop
-        # sending WIN while c2s blocks on the upstream); this catches a client
-        # ignoring flow control. Tunnel-fatal on purpose.
+        # credit that will never arrive.
         if c is None:
             self.rq.put(c)
             with self.cv:
                 self.dead = True
                 self.cv.notify_all()
             return
-        if self.rq.qsize() >= BACKLOG_MAX:
-            raise RuntimeError(f"stream {self.id}: backlog {self.rq.qsize()} >= {BACKLOG_MAX}")
+        with self.cv:
+            # A client honoring flow control stalls at INITIAL, so this clamp
+            # trips only on a protocol violation. Tunnel-fatal.
+            n = self.unread_bytes + len(c)
+            if n > INITIAL:
+                raise RuntimeError(f"stream {self.id}: unread {n} > {INITIAL} bytes")
+            self.unread_bytes = n
         self.rq.put(c)
 
 
