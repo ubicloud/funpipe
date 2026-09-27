@@ -6,9 +6,11 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -422,6 +424,26 @@ func TestTunnelEnd(t *testing.T) {
 		if _, err := d.Read(make([]byte, 1)); err != io.EOF {
 			t.Errorf("destination: %v", err)
 		}
+	}
+}
+
+// Splice closes each way on its own, as nc -N does.
+func TestSplice(t *testing.T) {
+	dest := listen(t, "tcp", func(c net.Conn) {
+		b, _ := io.ReadAll(c)
+		fmt.Fprintf(c, "got %d", len(b))
+	})
+	var w bytes.Buffer
+	c := newEnds()
+	s := &Server{Hook: c.hook}
+	if err := s.Splice(strings.NewReader("hello"), &w, dest); err != nil {
+		t.Fatal(err)
+	}
+	if w.String() != "got 5" {
+		t.Fatalf("got %q", w.String())
+	}
+	if e := c.next(t); e.Err != nil || e.Up != 5 || e.Down != 5 || e.Stream != 0 {
+		t.Fatalf("end: %+v", e)
 	}
 }
 
