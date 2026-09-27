@@ -8,7 +8,7 @@ test decides what a destination reads and when.
 import os, queue, select, socket, struct, threading, unittest
 
 import funpipe
-from funpipe import HDR, SYN, DATA
+from funpipe import HDR, SYN, DATA, FIN
 
 
 class Client:
@@ -76,6 +76,30 @@ class TestServer(unittest.TestCase):
         c.send(DATA, 0, 3, b"hi")
         self.assertEqual(read(other, 2), b"hi")
         self.assertEqual(read(dest, n), bytes(i % 256 for i in range(n)))
+
+    def test_close_ends_stream(self):
+        # A client's close ends the stream even when the destination neither
+        # sends nor closes, so such streams do not pile up to STREAMS_MAX.
+        c = Client()
+        held = []
+        for i in range(2 * funpipe.STREAMS_MAX):
+            sid = 2 * i + 1
+            dest = c.open(sid)
+            held.append(dest)
+            c.send(DATA, FIN, sid, b"ping")
+            self.assertEqual(read(dest, 4), b"ping")
+            self.assertEqual(dest.recv(1), b"")
+
+    def test_tunnel_end_ends_streams(self):
+        # The tunnel's end ends a stream whose destination has stopped reading.
+        c = Client()
+        dest = c.open(1)
+        chunk = bytes(funpipe.MAX)
+        for _ in range(funpipe.INITIAL // funpipe.MAX):
+            c.send(DATA, 0, 1, chunk)
+        os.close(c.w)
+        self.assertTrue(c.done.wait(5))
+        dest.close()
 
 
 if __name__ == "__main__":
