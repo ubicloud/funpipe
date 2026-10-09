@@ -32,9 +32,9 @@ module Mux
   # they only change in lockstep with the relay:
   #  - MAX_PAYLOAD must stay <= 0xFFFF (the length field is u16; 65536
   #    truncates to 0 and permanently desyncs the session).
-  #  - The relay's BACKLOG_MAX=16 assumes a compliant client has at most
-  #    INITIAL_WINDOW/MAX_PAYLOAD = 8 frames in flight per stream; a larger
-  #    window here is a protocol violation the relay kills the tunnel over.
+  #  - The relay bounds each stream's backlog at INITIAL_WINDOW bytes, as
+  #    a compliant client has no more in flight; a larger window here is a
+  #    protocol violation the relay kills the tunnel over.
   MAX_PAYLOAD    = 32_768
   INITIAL_WINDOW = 256 * 1024
   BINARY         = Encoding::BINARY

@@ -29,6 +29,10 @@ callers never do this -- http.Transport and the WS splice hold streams open
 until done. A client that needs half-close must first grow a distinct RST (or
 separate shutdown) frame; until then, do not point a half-closing client at
 this server.
+
+Closing a stream shuts its upstream down both ways, and so does the end of the
+tunnel, so an upstream that ignores a half-close, or has stopped reading,
+cannot hold a stream open.
 """
 
 import os, socket, struct, threading, queue
@@ -39,10 +43,10 @@ FIN = 1
 MAX, INITIAL = 32_768, 256 * 1024
 # Safety caps. Client misuse is the client's problem, but the server must not
 # let a buggy or hostile client OOM the bastion (and thus other processes).
-# Invariant: a client honoring flow control has at most INITIAL/MAX = 8 frames
-# in flight per stream, so BACKLOG_MAX only trips on a protocol violation.
+# Invariant: a client honoring flow control has at most INITIAL bytes in
+# flight per stream, however it frames them, so a backlog past INITIAL is a
+# protocol violation.
 STREAMS_MAX = 64    # concurrent streams per tunnel; cap on threads + sockets + memory
-BACKLOG_MAX = 16    # frames per stream; ~512KB worst case per stream
 
 
 class Mux:
@@ -50,6 +54,7 @@ class Mux:
         self.rfd, self.wfd = rfd, wfd
         self.wm = threading.Lock()
         self.streams = {}
+        self.closed = False
         self.accept_q = queue.Queue()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
 
@@ -117,8 +122,10 @@ class Mux:
                 elif t == WIN:
                     s.grant(struct.unpack("!I", p)[0])  # malformed = tunnel-fatal
         finally:
+            self.closed = True
             for s in list(self.streams.values()):
                 s.push(None)
+                s.shutdown()  # unblocks a c2s stuck on an upstream that stopped reading
             self.accept_q.put(None)
 
 
@@ -126,9 +133,11 @@ class Stream:
     def __init__(self, mux, sid, dest):
         self.mux, self.id, self.dest = mux, sid, dest
         self.rq = queue.Queue()
+        self.backlog = 0  # bytes pushed and not yet read
         self.swin = INITIAL
         self.cv = threading.Condition()
         self.dead = False
+        self.sock = None  # the upstream, once dialed
 
     def read(self):
         # Frame payloads are <= u16 max, so chunks pass through whole; the
@@ -136,6 +145,8 @@ class Stream:
         c = self.rq.get()
         if c is None:
             return None
+        with self.cv:
+            self.backlog -= len(c)
         self.mux.frame(WIN, 0, self.id, struct.pack("!I", len(c)))
         return c
 
@@ -158,6 +169,15 @@ class Stream:
     def close_write(self):
         self.mux.frame(DATA, FIN, self.id)
 
+    def shutdown(self):
+        # Both ways: the client has closed the stream (FIN is a full close,
+        # see module docstring), or the tunnel is gone.
+        try:
+            if self.sock is not None:
+                self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
     def grant(self, d):
         with self.cv:
             self.swin += d
@@ -166,17 +186,20 @@ class Stream:
     def push(self, c):
         # None = EOF, always admitted; it also kills a writer parked on WIN
         # credit that will never arrive. Data is subject to the hard backlog
-        # clamp: a well-behaved client stalls naturally at INITIAL (we stop
-        # sending WIN while c2s blocks on the upstream); this catches a client
-        # ignoring flow control. Tunnel-fatal on purpose.
+        # clamp, in bytes: a well-behaved client stalls naturally at INITIAL
+        # (we stop sending WIN while c2s blocks on the upstream); this catches
+        # a client ignoring flow control. Tunnel-fatal on purpose.
         if c is None:
             self.rq.put(c)
             with self.cv:
                 self.dead = True
                 self.cv.notify_all()
             return
-        if self.rq.qsize() >= BACKLOG_MAX:
-            raise RuntimeError(f"stream {self.id}: backlog {self.rq.qsize()} >= {BACKLOG_MAX}")
+        with self.cv:
+            n = self.backlog + len(c)
+            if n > INITIAL:
+                raise RuntimeError(f"stream {self.id}: backlog {n} > {INITIAL} bytes")
+            self.backlog = n
         self.rq.put(c)
 
 
@@ -200,6 +223,9 @@ def serve(stream, dial=_dial):
         stream.close_write()
         stream.mux.retire(stream.id)
         return
+    stream.sock = sock
+    if stream.mux.closed:
+        stream.shutdown()  # the tunnel ended while we dialed
 
     def s2c():
         try:
@@ -215,10 +241,7 @@ def serve(stream, dial=_dial):
                 sock.sendall(data)
         except OSError:
             pass
-        try:
-            sock.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
+        stream.shutdown()
 
     t1 = threading.Thread(target=s2c, daemon=True)
     t1.start()
@@ -236,10 +259,10 @@ def run(rfd, wfd, dial=_dial):
     # sockets are closed deterministically before we return (matters when
     # embedded in a longer-lived process). Returns the Mux for inspection.
     #
-    # On EOF the reader's finally-block push(None)s every live stream, which
-    # unblocks each serve()'s s2c/c2s, so these joins are bounded by in-flight
-    # upstream I/O, not indefinite. Threads stay daemon so a hung upstream
-    # can't wedge interpreter shutdown.
+    # On EOF the reader's finally-block push(None)s and shuts down every live
+    # stream, which unblocks each serve()'s s2c/c2s, so these joins are bounded
+    # by in-flight upstream I/O, not indefinite. Threads stay daemon so a hung
+    # upstream can't wedge interpreter shutdown.
     mux = Mux(rfd, wfd).start()
     workers = []
     while (s := mux.accept()) is not None:
