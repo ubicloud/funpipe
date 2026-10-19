@@ -193,6 +193,16 @@ class TestServer(unittest.TestCase):
         c.send(DATA, 0, 3, b"hi")
         self.assertEqual(read(other, 2), b"hi")
 
+    def test_open_twice_ends_tunnel(self):
+        c = Client()
+        upstream = c.open(1)
+        raised = queue.Queue()
+        with mock.patch("threading.excepthook", raised.put):
+            c.send(SYN, 0, 1, b"dest 1")
+            self.assertIn("opened twice", str(raised.get(timeout=5).exc_value))
+        self.assertTrue(c.done.wait(5))
+        upstream.close()
+
 
 if __name__ == "__main__":
     unittest.main()

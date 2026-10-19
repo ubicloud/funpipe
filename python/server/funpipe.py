@@ -94,6 +94,10 @@ class Mux:
                 if p is None:
                     break
                 if t == SYN:
+                    if sid in self.streams:
+                        # The id is in use, so refusing with a FIN, as at
+                        # the cap, would be ambiguous. Tunnel-fatal.
+                        raise RuntimeError(f"stream {sid}: opened twice")
                     if len(self.streams) >= STREAMS_MAX:
                         # cap reached: refuse without registering. Client sees
                         # immediate EOF on the stream's read side.
