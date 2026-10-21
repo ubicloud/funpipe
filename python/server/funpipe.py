@@ -39,10 +39,7 @@ FIN = 1
 MAX, INITIAL = 32_768, 256 * 1024
 # Safety caps. Client misuse is the client's problem, but the server must not
 # let a buggy or hostile client OOM the bastion (and thus other processes).
-# Invariant: a client honoring flow control has at most INITIAL/MAX = 8 frames
-# in flight per stream, so BACKLOG_MAX only trips on a protocol violation.
 STREAMS_MAX = 64    # concurrent streams per tunnel; cap on threads + sockets + memory
-BACKLOG_MAX = 16    # frames per stream; ~512KB worst case per stream
 
 
 class Mux:
@@ -50,6 +47,7 @@ class Mux:
         self.rfd, self.wfd = rfd, wfd
         self.wm = threading.Lock()
         self.streams = {}
+        self.closed = False
         self.accept_q = queue.Queue()
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
 
@@ -96,6 +94,10 @@ class Mux:
                 if p is None:
                     break
                 if t == SYN:
+                    if sid in self.streams:
+                        # The id is in use, so refusing with a FIN, as at
+                        # the cap, would be ambiguous. Tunnel-fatal.
+                        raise RuntimeError(f"stream {sid}: opened twice")
                     if len(self.streams) >= STREAMS_MAX:
                         # cap reached: refuse without registering. Client sees
                         # immediate EOF on the stream's read side.
@@ -117,8 +119,10 @@ class Mux:
                 elif t == WIN:
                     s.grant(struct.unpack("!I", p)[0])  # malformed = tunnel-fatal
         finally:
+            self.closed = True
             for s in list(self.streams.values()):
                 s.push(None)
+                s.shutdown()
             self.accept_q.put(None)
 
 
@@ -126,9 +130,12 @@ class Stream:
     def __init__(self, mux, sid, dest):
         self.mux, self.id, self.dest = mux, sid, dest
         self.rq = queue.Queue()
+        self.unread_bytes = 0
         self.swin = INITIAL
         self.cv = threading.Condition()
         self.dead = False
+        self.sock = None
+        self.sock_lock = threading.Lock()
 
     def read(self):
         # Frame payloads are <= u16 max, so chunks pass through whole; the
@@ -136,6 +143,9 @@ class Stream:
         c = self.rq.get()
         if c is None:
             return None
+        # Decrement before sending WIN, or a prompt client trips the clamp.
+        with self.cv:
+            self.unread_bytes -= len(c)
         self.mux.frame(WIN, 0, self.id, struct.pack("!I", len(c)))
         return c
 
@@ -158,6 +168,16 @@ class Stream:
     def close_write(self):
         self.mux.frame(DATA, FIN, self.id)
 
+    def shutdown(self):
+        # serve() clears sock under sock_lock before it closes the socket,
+        # so the fd cannot be closed and reused during the call.
+        with self.sock_lock:
+            try:
+                if self.sock is not None:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def grant(self, d):
         with self.cv:
             self.swin += d
@@ -165,18 +185,20 @@ class Stream:
 
     def push(self, c):
         # None = EOF, always admitted; it also kills a writer parked on WIN
-        # credit that will never arrive. Data is subject to the hard backlog
-        # clamp: a well-behaved client stalls naturally at INITIAL (we stop
-        # sending WIN while c2s blocks on the upstream); this catches a client
-        # ignoring flow control. Tunnel-fatal on purpose.
+        # credit that will never arrive.
         if c is None:
             self.rq.put(c)
             with self.cv:
                 self.dead = True
                 self.cv.notify_all()
             return
-        if self.rq.qsize() >= BACKLOG_MAX:
-            raise RuntimeError(f"stream {self.id}: backlog {self.rq.qsize()} >= {BACKLOG_MAX}")
+        with self.cv:
+            # A client honoring flow control stalls at INITIAL, so this clamp
+            # trips only on a protocol violation. Tunnel-fatal.
+            n = self.unread_bytes + len(c)
+            if n > INITIAL:
+                raise RuntimeError(f"stream {self.id}: unread {n} > {INITIAL} bytes")
+            self.unread_bytes = n
         self.rq.put(c)
 
 
@@ -200,6 +222,13 @@ def serve(stream, dial=_dial):
         stream.close_write()
         stream.mux.retire(stream.id)
         return
+    # The reader sets closed, then shuts sock down under sock_lock. Set
+    # sock and read closed under the lock, so one of the two shuts it down.
+    with stream.sock_lock:
+        stream.sock = sock
+        closed = stream.mux.closed
+    if closed:
+        stream.shutdown()
 
     def s2c():
         try:
@@ -215,10 +244,7 @@ def serve(stream, dial=_dial):
                 sock.sendall(data)
         except OSError:
             pass
-        try:
-            sock.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
+        stream.shutdown()
 
     t1 = threading.Thread(target=s2c, daemon=True)
     t1.start()
@@ -226,6 +252,8 @@ def serve(stream, dial=_dial):
     t2.start()
     t1.join()
     t2.join()
+    with stream.sock_lock:
+        stream.sock = None
     sock.close()
     stream.mux.retire(stream.id)
 
@@ -236,10 +264,10 @@ def run(rfd, wfd, dial=_dial):
     # sockets are closed deterministically before we return (matters when
     # embedded in a longer-lived process). Returns the Mux for inspection.
     #
-    # On EOF the reader's finally-block push(None)s every live stream, which
-    # unblocks each serve()'s s2c/c2s, so these joins are bounded by in-flight
-    # upstream I/O, not indefinite. Threads stay daemon so a hung upstream
-    # can't wedge interpreter shutdown.
+    # On EOF the reader's finally-block push(None)s and shuts down every live
+    # stream, which unblocks each serve()'s s2c/c2s, so these joins are bounded
+    # by in-flight upstream I/O, not indefinite. Threads stay daemon so a hung
+    # upstream can't wedge interpreter shutdown.
     mux = Mux(rfd, wfd).start()
     workers = []
     while (s := mux.accept()) is not None:
